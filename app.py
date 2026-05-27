@@ -1,5 +1,5 @@
 # ============================================================
-# app_sped_dominio.py  –  SPED Fiscal → Domínio Sistemas V2.0
+# app_sped_dominio.py  –  SPED Fiscal → Domínio Sistemas V2.1
 # Dependências: streamlit, requests, pandas
 # pip install streamlit requests pandas
 # ============================================================
@@ -10,11 +10,11 @@ import time
 import re
 from datetime import datetime
 
-VERSAO = "V2.0"
+VERSAO = "V2.1"
 COD_PAIS_BRASIL = {"1058", "01058"}
 SITUACAO_ATIVA  = 2
-SITUACOES_DESCRICAO = {1:"NULA", 2:"ATIVA", 3:"SUSPENSA", 4:"INAPTA", 8:"BAIXADA"}
-SITUACAO_ICONE  = {1:"🚫", 2:"✅", 3:"⚠️", 4:"⛔", 8:"❌"}
+SITUACOES_DESCRICAO = {1: "NULA", 2: "ATIVA", 3: "SUSPENSA", 4: "INAPTA", 8: "BAIXADA"}
+SITUACAO_ICONE  = {1: "🚫", 2: "✅", 3: "⚠️", 4: "⛔", 8: "❌"}
 
 
 # ==============================
@@ -128,27 +128,29 @@ def mapear_regime(porte: str | None, opcao_simples: bool = False) -> str:
 
 def extrair_cod_ibge(dados_api: dict) -> str:
     """
-    Extrai o código IBGE do município da API minhareceita.org.
-
-    A API retorna:
-      "codigo_municipio_ibge": 3550308   ← código IBGE de 7 dígitos (int ou str)
-      "municipio": "SAO PAULO"           ← nome por extenso (NÃO usar no campo 09)
-
-    O Domínio Sistemas aceita no campo 09:
-      - Código estadual
-      - Código federal
-      - Código IBGE/RAIS  ← usamos este
-
-    Retorna string com o código IBGE ou "" se não disponível.
+    Retorna o código IBGE do município da API minhareceita.org.
+    Campo: "codigo_municipio_ibge" → int ou str, ex: 3550308
+    NUNCA retorna o campo "municipio" (nome por extenso).
     """
     cod = dados_api.get("codigo_municipio_ibge")
     if cod is None:
         return ""
     cod_str = str(cod).strip()
-    # Remove zeros à esquerda desnecessários mas mantém o formato original
-    if cod_str.isdigit() and len(cod_str) > 0:
-        return cod_str
-    return ""
+    return cod_str if cod_str.isdigit() else ""
+
+def sanitizar_numero_endereco(valor: str) -> str:
+    """
+    Campo 06 — Número do endereço (Numérico no leiaute Domínio).
+    Valor não numérico (S/N, SN, s/n, -, --, em branco) → retorna vazio.
+    Valor numérico → retorna apenas os dígitos.
+    """
+    if not valor:
+        return ""
+    v = valor.strip()
+    apenas_digitos = re.sub(r"\D", "", v)
+    if not apenas_digitos:
+        return ""
+    return apenas_digitos
 
 
 # ==============================
@@ -245,7 +247,7 @@ def extrair_participantes_sped(conteudo: str) -> list:
                 "cnpj":     _get(campos,  4),
                 "cpf":      _get(campos,  5),
                 "ie":       _get(campos,  6),
-                "cod_mun":  _get(campos,  7),  # código do SPED — usar só quando não há API
+                "cod_mun":  _get(campos,  7),  # código IBGE do SPED
                 "suframa":  _get(campos,  8),
                 "end":      _get(campos,  9),
                 "num":      _get(campos, 10),
@@ -290,6 +292,11 @@ def classificar_participantes(conteudo: str, log: list) -> dict:
 # GERAÇÃO DE LINHAS DOMÍNIO
 # ==============================
 def gerar_linha_0000(cnpj_empresa: str) -> str:
+    """
+    Registro 0000 — Identificação da empresa.
+    Campo 01: "0000" (fixo)
+    Campo 02: CNPJ apenas números
+    """
     return f"0000|{limpar_cnpj(cnpj_empresa)}|\n"
 
 
@@ -297,47 +304,39 @@ def _montar_endereco(dados_api: dict, dados_sped: dict,
                      exterior: bool, usar_sped: bool) -> dict:
     """
     ┌──────────────────────────────────────────────────────────────────────┐
-    │ Campo 09 — Código do município                                       │
+    │ Campo 06 — Número do endereço (Numérico)                             │
+    │   Valor não numérico (S/N, SN, s/n, -, --) → VAZIO                  │
+    │   Valor numérico → apenas dígitos                                    │
     │                                                                      │
-    │ Leiaute Domínio (Registro 0010/0020):                                │
-    │   "Será informado o código do município:                             │
-    │    estadual, federal ou IBGE/RAIS."                                  │
+    │ Campo 09 — Código do município (Numérico IBGE)                       │
+    │   Leiaute: "código estadual, federal ou IBGE/RAIS"                   │
     │                                                                      │
-    │ Fonte dos dados:                                                     │
+    │   CNPJ ATIVO (API)  → codigo_municipio_ibge da Receita Federal       │
+    │                        ex: 3550308, 4106902, 3106200                 │
+    │   CNPJ BAIXADO/INAPTO/SUSPENSO/CPF/SEM API                          │
+    │                      → cod_mun do registro 0150 do SPED              │
+    │   EXTERIOR          → "EX"                                           │
     │                                                                      │
-    │ CNPJ ATIVO (API):                                                    │
-    │   → dados_api["codigo_municipio_ibge"]                               │
-    │   → Código IBGE de 7 dígitos retornado pela Receita Federal         │
-    │   → Ex: 3550308 (São Paulo), 4106902 (Curitiba)                     │
+    │   NUNCA usar dados_api["municipio"] (nome por extenso)               │
     │                                                                      │
-    │ CNPJ BAIXADO/INAPTO/SUSPENSO/CPF/SEM API:                           │
-    │   → cod_mun do registro 0150 do SPED                                │
-    │   → Já é o código IBGE informado pelo contribuinte no SPED          │
+    │ Campo 10 — UF                                                        │
+    │   CNPJ ATIVO  → dados_api["uf"]                                      │
+    │   SPED        → vazio                                                │
+    │   EXTERIOR    → "EX"                                                 │
     │                                                                      │
-    │ EXTERIOR:                                                            │
-    │   → "EX"                                                             │
+    │ Campo 11 — Código do País                                            │
+    │   EXTERIOR    → cod_pais do SPED                                     │
+    │   Nacional    → vazio                                                │
     │                                                                      │
-    │ NUNCA usar dados_api["municipio"] (nome por extenso)                 │
-    │ NUNCA usar o código de 4 dígitos interno do sistema de origem        │
+    │ Campo 12 — CEP                                                       │
+    │   CNPJ ATIVO  → CEP da Receita (8 dígitos, sem traço)               │
+    │   Demais      → vazio                                                │
     └──────────────────────────────────────────────────────────────────────┘
-
-    Campo 10 — UF:
-      CNPJ ATIVO  → dados_api["uf"]
-      SPED        → vazio (UF não está no 0150 de forma confiável)
-      EXTERIOR    → "EX"
-
-    Campo 11 — Código do País:
-      EXTERIOR    → cod_pais do SPED
-      Nacional    → vazio
-
-    Campo 12 — CEP:
-      CNPJ ATIVO  → CEP da Receita (8 dígitos, sem traço)
-      Demais      → vazio
     """
     if exterior:
         return {
             "logradouro":  _gs(dados_sped, "end"),
-            "numero":      _gs(dados_sped, "num"),
+            "numero":      sanitizar_numero_endereco(_gs(dados_sped, "num")),
             "complemento": _gs(dados_sped, "compl"),
             "bairro":      _gs(dados_sped, "bairro"),
             "cod_mun":     "EX",
@@ -348,14 +347,13 @@ def _montar_endereco(dados_api: dict, dados_sped: dict,
 
     elif usar_sped:
         # CNPJ baixado/inapto/suspenso/CPF/sem API
-        # Usa cod_mun do SPED (código IBGE informado pelo contribuinte no SPED)
-        cod_mun_sped = _gs(dados_sped, "cod_mun")
+        # Usa cod_mun do SPED (código IBGE informado pelo contribuinte)
         return {
             "logradouro":  _gs(dados_sped, "end"),
-            "numero":      _gs(dados_sped, "num"),
+            "numero":      sanitizar_numero_endereco(_gs(dados_sped, "num")),
             "complemento": _gs(dados_sped, "compl"),
             "bairro":      _gs(dados_sped, "bairro"),
-            "cod_mun":     cod_mun_sped,  # ← código IBGE do SPED
+            "cod_mun":     _gs(dados_sped, "cod_mun"),  # ← código IBGE do SPED
             "uf":          "",
             "cod_pais":    "",
             "cep":         "",
@@ -363,15 +361,17 @@ def _montar_endereco(dados_api: dict, dados_sped: dict,
 
     else:
         # CNPJ ATIVO — dados da Receita Federal
-        # Campo 09 = codigo_municipio_ibge da API (7 dígitos)
+        # Campo 09 = codigo_municipio_ibge da API (número, ex: 3550308)
+        # NUNCA usar dados_api["municipio"] (nome por extenso)
         cod_ibge_api = extrair_cod_ibge(dados_api)
+        num_api      = dados_api.get("numero", _gs(dados_sped, "num")) or ""
         cep_api      = re.sub(r"\D", "", dados_api.get("cep", "") or "")
         return {
             "logradouro":  (dados_api.get("logradouro",  _gs(dados_sped, "end"))  or ""),
-            "numero":      (dados_api.get("numero",      _gs(dados_sped, "num"))  or ""),
+            "numero":      sanitizar_numero_endereco(str(num_api)),
             "complemento": (dados_api.get("complemento", _gs(dados_sped, "compl")) or ""),
             "bairro":      (dados_api.get("bairro",      _gs(dados_sped, "bairro")) or ""),
-            "cod_mun":     cod_ibge_api,  # ← código IBGE da Receita Federal (7 dígitos)
+            "cod_mun":     cod_ibge_api,  # ← código IBGE numérico da Receita Federal
             "uf":          (dados_api.get("uf", "") or ""),
             "cod_pais":    "",
             "cep":         cep_api,
@@ -447,59 +447,62 @@ def _montar_comuns(dados_api: dict, dados_sped: dict,
     apelido = razao[:40]
 
     return {
-        "inscricao": inscricao,
-        "razao":     razao,
-        "apelido":   apelido,
-        "ie":        ie,
-        "im":        "",
-        "suframa":   suframa,
-        "ddd":       ddd,
-        "telefone":  telefone,
-        "fax":       fax,
-        "data_cad":  "",        # ← SEMPRE VAZIO
-        "nat_jur":   nat_jur,
-        "regime":    regime,
-        "email":     email,
+        "inscricao": inscricao,   # campo 02 — CNPJ/CPF apenas números
+        "razao":     razao,       # campo 03 — máx 150
+        "apelido":   apelido,     # campo 04 — razao[:40]
+        "ie":        ie,          # campo 13
+        "im":        "",          # campo 14
+        "suframa":   suframa,     # campo 15
+        "ddd":       ddd,         # campo 16
+        "telefone":  telefone,    # campo 17
+        "fax":       fax,         # campo 18
+        "data_cad":  "",          # campo 19 — SEMPRE VAZIO
+        "nat_jur":   nat_jur,     # campo 23
+        "regime":    regime,      # campo 24
+        "email":     email,       # campo 29 (só 0020)
     }
 
 
 def gerar_linha_0010(dados_api: dict, dados_sped: dict,
                      exterior: bool, usar_sped: bool) -> str:
-    """Registro 0010 — Cadastro de cliente (32 campos)."""
+    """
+    Registro 0010 — Cadastro de cliente (32 campos).
+    Leiaute conforme Registro 0010.xlsx.
+    """
     end = _montar_endereco(dados_api, dados_sped, exterior, usar_sped)
     c   = _montar_comuns(dados_api, dados_sped, exterior, usar_sped)
 
     campos = [
-        "0010",           # 01 Identificação
-        c["inscricao"],   # 02 Inscrição (CNPJ/CPF apenas números)
-        c["razao"],       # 03 Razão Social (máx 150)
-        c["apelido"],     # 04 Apelido = razao[:40]
+        "0010",             # 01 Identificação — fixo "0010"
+        c["inscricao"],     # 02 Inscrição — CNPJ/CPF apenas números
+        c["razao"],         # 03 Razão Social — máx 150 chars
+        c["apelido"],       # 04 Apelido — razao[:40]
         end["logradouro"],  # 05 Endereço
-        end["numero"],      # 06 Número
+        end["numero"],      # 06 Número — numérico; S/N e similares → vazio
         end["complemento"], # 07 Complemento
         end["bairro"],      # 08 Bairro
-        end["cod_mun"],     # 09 Código IBGE (API: codigo_municipio_ibge | SPED: cod_mun | EXT: EX)
-        end["uf"],          # 10 UF
-        end["cod_pais"],    # 11 Código do País (só exterior)
-        end["cep"],         # 12 CEP (8 dígitos)
+        end["cod_mun"],     # 09 Código município — IBGE numérico ou "EX"
+        end["uf"],          # 10 UF — ou "EX" para exterior
+        end["cod_pais"],    # 11 Código do País — só exterior
+        end["cep"],         # 12 CEP — 8 dígitos sem traço
         c["ie"],            # 13 Inscrição Estadual
         c["im"],            # 14 Inscrição Municipal
         c["suframa"],       # 15 Inscrição Suframa
         c["ddd"],           # 16 DDD
         c["telefone"],      # 17 Telefone
         c["fax"],           # 18 FAX
-        c["data_cad"],      # 19 Data cadastro → VAZIO
+        c["data_cad"],      # 19 Data cadastro — SEMPRE VAZIO
         "",                 # 20 Conta contábil
         "",                 # 21 Conta contábil fornecedor
-        "N",                # 22 Agropecuário
-        c["nat_jur"],       # 23 Natureza jurídica
-        c["regime"],        # 24 Regime de apuração
-        "N",                # 25 Contribuinte ICMS
+        "N",                # 22 Agropecuário — S/N
+        c["nat_jur"],       # 23 Natureza jurídica — 1 a 9
+        c["regime"],        # 24 Regime de apuração — N/M/E/O/U/I
+        "N",                # 25 Contribuinte ICMS — S/N
         "",                 # 26 Alíquota ICMS
         "",                 # 27 Categoria do estabelecimento
-        "N",                # 28 Interdependência
+        "N",                # 28 Interdependência — S/N
         "",                 # 29 MT-Percentual Carga Média
-        "N",                # 30 Inscrito no PAA
+        "N",                # 30 Inscrito no PAA — S/N
         "",                 # 31 Tipo Inscrição
         "",                 # 32 Processo adm/judicial
     ]
@@ -508,42 +511,45 @@ def gerar_linha_0010(dados_api: dict, dados_sped: dict,
 
 def gerar_linha_0020(dados_api: dict, dados_sped: dict,
                      exterior: bool, usar_sped: bool) -> str:
-    """Registro 0020 — Cadastro de fornecedor (33 campos)."""
+    """
+    Registro 0020 — Cadastro de fornecedor (33 campos).
+    Leiaute conforme Registro 0020.xlsx.
+    """
     end = _montar_endereco(dados_api, dados_sped, exterior, usar_sped)
     c   = _montar_comuns(dados_api, dados_sped, exterior, usar_sped)
 
     campos = [
-        "0020",           # 01 Identificação
-        c["inscricao"],   # 02 Inscrição (CNPJ/CPF apenas números)
-        c["razao"],       # 03 Razão Social (máx 150)
-        c["apelido"],     # 04 Apelido = razao[:40]
+        "0020",             # 01 Identificação — fixo "0020"
+        c["inscricao"],     # 02 Inscrição — CNPJ/CPF apenas números
+        c["razao"],         # 03 Razão Social — máx 150 chars
+        c["apelido"],       # 04 Apelido — razao[:40]
         end["logradouro"],  # 05 Endereço
-        end["numero"],      # 06 Número
+        end["numero"],      # 06 Número — numérico; S/N e similares → vazio
         end["complemento"], # 07 Complemento
         end["bairro"],      # 08 Bairro
-        end["cod_mun"],     # 09 Código IBGE (API: codigo_municipio_ibge | SPED: cod_mun | EXT: EX)
-        end["uf"],          # 10 UF
-        end["cod_pais"],    # 11 Código do País (só exterior)
-        end["cep"],         # 12 CEP (8 dígitos)
+        end["cod_mun"],     # 09 Código município — IBGE numérico ou "EX"
+        end["uf"],          # 10 UF — ou "EX" para exterior
+        end["cod_pais"],    # 11 Código do País — só exterior
+        end["cep"],         # 12 CEP — 8 dígitos sem traço
         c["ie"],            # 13 Inscrição Estadual
         c["im"],            # 14 Inscrição Municipal
         c["suframa"],       # 15 Inscrição Suframa
         c["ddd"],           # 16 DDD
         c["telefone"],      # 17 Telefone
         c["fax"],           # 18 FAX
-        c["data_cad"],      # 19 Data cadastro → VAZIO
+        c["data_cad"],      # 19 Data cadastro — SEMPRE VAZIO
         "",                 # 20 Conta contábil
         "",                 # 21 Conta contábil cliente
-        "N",                # 22 Agropecuário
-        c["nat_jur"],       # 23 Natureza jurídica
-        c["regime"],        # 24 Regime de apuração
-        "N",                # 25 Contribuinte ICMS
+        "N",                # 22 Agropecuário — S/N
+        c["nat_jur"],       # 23 Natureza jurídica — 1 a 8
+        c["regime"],        # 24 Regime de apuração — N/M/E/O/U/I
+        "N",                # 25 Contribuinte ICMS — S/N
         "",                 # 26 Alíquota ICMS
         "",                 # 27 Categoria do estabelecimento
         "",                 # 28 Inscrição Estadual ST
         c["email"],         # 29 Email
-        "N",                # 30 Interdependência
-        "N",                # 31 Contribuinte da CPRB
+        "N",                # 30 Interdependência — S/N
+        "N",                # 31 Contribuinte da CPRB — S/N
         "",                 # 32 Processo adm/judicial
         "",                 # 33 Tipo Inscrição
     ]
@@ -555,6 +561,12 @@ def gerar_linha_0020(dados_api: dict, dados_sped: dict,
 # ==============================
 def processar_sped(conteudo_sped: str, modo: str,
                    delay_api: float, log: list) -> tuple:
+    """
+    modo = "auto"         → classifica por C100/D100
+         = "clientes"     → gera só 0010 para todos
+         = "fornecedores" → gera só 0020 para todos
+         = "ambos"        → gera 0010 e 0020 para todos
+    """
     cabecalho = extrair_cabecalho_sped(conteudo_sped, log)
     if cabecalho is None:
         return None, None, None, None
@@ -578,9 +590,10 @@ def processar_sped(conteudo_sped: str, modo: str,
         log.append("AVISO: Nenhum registro 0150 encontrado.")
         return (
             [gerar_linha_0000(cnpj_empresa)],
-            [], {"api_ativa": 0, "baixada": 0, "inapta": 0,
-                 "suspensa": 0, "nula": 0, "sem_api": 0,
-                 "cpf_sped": 0, "exterior": 0},
+            [],
+            {"api_ativa": 0, "baixada": 0, "inapta": 0,
+             "suspensa": 0, "nula": 0, "sem_api": 0,
+             "cpf_sped": 0, "exterior": 0},
             cabecalho,
         )
 
@@ -639,6 +652,7 @@ def processar_sped(conteudo_sped: str, modo: str,
         # ── Fonte dos dados ──────────────────────────────────────────
         if exterior:
             usar_sped    = True
+            cod_mun_log  = "EX"
             status_label = f"🌍 Exterior (COD_PAIS={part['cod_pais']})"
             contadores["exterior"] += 1
             log.append(
@@ -655,7 +669,7 @@ def processar_sped(conteudo_sped: str, modo: str,
                 cod_mun_log  = part["cod_mun"]
                 status_label = (
                     f"⚠️ {cnpj_raw} — sem resposta da API. "
-                    f"Usando SPED. Município (SPED): {cod_mun_log}"
+                    f"Usando SPED. Município IBGE (SPED): {cod_mun_log}"
                 )
                 contadores["sem_api"] += 1
                 log.append(
@@ -681,7 +695,7 @@ def processar_sped(conteudo_sped: str, modo: str,
                     status_label = (
                         f"{icone} {cnpj_raw} — {situacao_desc} "
                         f"(sit. {situacao_cod}). "
-                        f"Usando SPED. Município (SPED): {cod_mun_log}"
+                        f"Usando SPED. Município IBGE (SPED): {cod_mun_log}"
                     )
                     if   situacao_cod == 8: contadores["baixada"]  += 1
                     elif situacao_cod == 4: contadores["inapta"]   += 1
@@ -698,7 +712,7 @@ def processar_sped(conteudo_sped: str, modo: str,
             cod_mun_log  = part["cod_mun"]
             status_label = (
                 f"ℹ️ {cnpj_raw or limpar_cnpj(part['cpf'])} — "
-                f"CPF/sem CNPJ. Usando SPED. Município (SPED): {cod_mun_log}"
+                f"CPF/sem CNPJ. Usando SPED. Município IBGE (SPED): {cod_mun_log}"
             )
             contadores["cpf_sped"] += 1
             log.append(
@@ -717,17 +731,17 @@ def processar_sped(conteudo_sped: str, modo: str,
             )
 
         dados_tabela.append({
-            "COD_PART":           cod_part,
-            "CNPJ/CPF":           cnpj_raw or limpar_cnpj(part["cpf"]),
-            "Nome (SPED)":        part["nome"],
-            "Razão Social (API)": dados_api.get("razao_social", ""),
-            "Município IBGE":     cod_mun_log,
-            "Apelido":            razao_final[:40],
-            "Papel":              papel,
-            "Situação Receita":   situacao_desc or "—",
-            "COD_PAIS":           part["cod_pais"],
-            "Fonte":              "SPED" if usar_sped else "Receita Federal",
-            "Status":             status_label,
+            "COD_PART":             cod_part,
+            "CNPJ/CPF":             cnpj_raw or limpar_cnpj(part["cpf"]),
+            "Nome (SPED)":          part["nome"],
+            "Razão Social (API)":   dados_api.get("razao_social", ""),
+            "Município IBGE (c09)": cod_mun_log,
+            "Apelido":              razao_final[:40],
+            "Papel":                papel,
+            "Situação Receita":     situacao_desc or "—",
+            "COD_PAIS":             part["cod_pais"],
+            "Fonte":                "SPED" if usar_sped else "Receita Federal",
+            "Status":               status_label,
         })
 
         log_area.text_area(
@@ -801,14 +815,22 @@ def main():
             min_value=0.5, max_value=5.0, value=1.0, step=0.5,
         )
         st.markdown("---")
-        st.markdown("### 📋 Campo 09 — Município (Código IBGE)")
+        st.markdown("### 📋 Campo 09 — Município (IBGE)")
         st.markdown(
-            "| Situação | Fonte | Campo 09 |\n"
+            "| Situação | Fonte | Valor |\n"
             "|---|---|---|\n"
             "| CNPJ Ativo | Receita Federal | `codigo_municipio_ibge` |\n"
             "| CNPJ Baixado/Inapto/Suspenso | SPED 0150 | `cod_mun` |\n"
             "| CPF / Sem API | SPED 0150 | `cod_mun` |\n"
             "| Exterior | — | `EX` |"
+        )
+        st.markdown("---")
+        st.markdown("### 📋 Campo 06 — Número")
+        st.markdown(
+            "| Valor | Campo 06 |\n"
+            "|---|---|\n"
+            "| `3355`, `450`, `17790` | Mantém |\n"
+            "| `S/N`, `SN`, `s/n`, `-` | **Vazio** |"
         )
         st.markdown("---")
         st.markdown("### 📋 Situação Cadastral")
@@ -854,22 +876,21 @@ def main():
 
             <hr>
 
-            <h4>⚠ Observações importantes (V2.0)</h4>
+            <h4>⚠ Observações importantes (V2.1)</h4>
             <ul>
+                <li><b>Campo 06 — Número do endereço</b>: valores não numéricos
+                    (<code>S/N</code>, <code>SN</code>, <code>s/n</code>, <code>-</code>)
+                    são substituídos por <b>vazio</b> — o campo é Numérico no leiaute.</li>
                 <li><b>Campo 09 — Código do município</b>:
-                    <ul>
-                        <li>CNPJ ativo: usa <code>codigo_municipio_ibge</code> da Receita Federal
-                            (7 dígitos, ex: <code>3550308</code> para São Paulo).</li>
-                        <li>CNPJ baixado/inapto/suspenso/CPF: usa <code>cod_mun</code>
-                            do registro 0150 do SPED.</li>
-                        <li>Exterior: <code>EX</code>.</li>
-                    </ul>
-                </li>
+                    CNPJ ativo → <code>codigo_municipio_ibge</code> da Receita Federal
+                    (ex: <code>3550308</code>).
+                    Demais → <code>cod_mun</code> do SPED.
+                    Exterior → <code>EX</code>.</li>
                 <li><b>Campo 19 — Data do cadastro</b>: sempre <b>vazia</b> —
                     evita o erro <i>"Não existem parâmetros para a vigência"</i>.</li>
-                <li><b>CNPJ Ativo</b>: todos os dados vêm da <b>Receita Federal</b>.</li>
+                <li><b>CNPJ Ativo</b>: dados da <b>Receita Federal</b>.</li>
                 <li><b>CNPJ Baixado/Inapto/Suspenso</b>: CNPJ + dados do <b>SPED</b>.</li>
-                <li><b>Exterior</b>: dados do SPED; campo 09 e 10 = <code>EX</code>.</li>
+                <li><b>Exterior</b>: dados do SPED; campos 09 e 10 = <code>EX</code>.</li>
             </ul>
 
             </div>
