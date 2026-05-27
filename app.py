@@ -13,7 +13,7 @@ from datetime import datetime
 # ==============================
 # VERSÃO
 # ==============================
-VERSAO = "V1.0"
+VERSAO = "V1.1"
 
 # ==============================
 # CONSTANTES
@@ -37,7 +37,7 @@ SITUACAO_ICONE = {
 }
 
 # ==============================
-# TEMA TR
+# TEMA TR  (idêntico ao gerador_rpa_txt)
 # ==============================
 def apply_tr_theme():
     st.markdown("""
@@ -157,11 +157,6 @@ def get_situacao_cadastral(dados_api: dict) -> tuple[int, str]:
     return codigo, descricao
 
 
-def cnpj_esta_ativo(dados_api: dict) -> bool:
-    codigo, _ = get_situacao_cadastral(dados_api)
-    return codigo == SITUACAO_ATIVA
-
-
 def consultar_cnpj(cnpj: str) -> dict | None:
     cnpj_limpo = limpar_cnpj(cnpj)
     if len(cnpj_limpo) != 14:
@@ -185,7 +180,10 @@ def mapear_natureza_juridica(codigo_nj) -> str:
     if s.startswith("20"): return "4"
     if s.startswith("21"): return "5"
     if s.startswith("22"): return "6"
-    if int(codigo_nj) == 2150: return "8"
+    try:
+        if int(codigo_nj) == 2150: return "8"
+    except Exception:
+        pass
     return "7"
 
 
@@ -193,21 +191,105 @@ def mapear_porte(porte: str | None) -> str:
     if not porte:
         return "N"
     p = porte.upper()
-    if "MICRO" in p or p == "ME":  return "M"
+    if "MICRO" in p or p == "ME":    return "M"
     if "PEQUENO" in p or p == "EPP": return "E"
-    if "SIMPLES" in p:             return "M"
+    if "SIMPLES" in p:               return "M"
     return "N"
 
 
+# ==============================
+# LEITURA DO SPED FISCAL
+# ==============================
+
+def _split_sped(linha: str) -> list[str]:
+    """Faz o split por pipe e remove os elementos vazios das extremidades."""
+    campos = linha.strip().split("|")
+    if campos and campos[0] == "":
+        campos = campos[1:]
+    if campos and campos[-1] == "":
+        campos = campos[:-1]
+    return campos
+
+
+def extrair_cabecalho_sped(conteudo: str, log: list) -> dict | None:
+    """
+    Extrai os dados da empresa do registro 0000 do SPED Fiscal.
+
+    Layout do registro 0000:
+    |0000|COD_VER|TIPO_ESCRIT|IND_SIT_ESP|NUM_REC_ANTERIOR|
+     DT_INI|DT_FIN|NOME|CNPJ|CPF|UF|IE|COD_MUN|IM|SUFRAMA|
+     IND_PERFIL|IND_ATIV|
+
+    Posições (após split, índice 0 = "0000"):
+      [1]  COD_VER
+      [2]  TIPO_ESCRIT
+      [3]  IND_SIT_ESP
+      [4]  NUM_REC_ANTERIOR
+      [5]  DT_INI
+      [6]  DT_FIN
+      [7]  NOME
+      [8]  CNPJ          ← usado no registro 0000 do Domínio
+      [9]  CPF
+      [10] UF
+      [11] IE
+      [12] COD_MUN
+      [13] IM
+      [14] SUFRAMA
+      [15] IND_PERFIL
+      [16] IND_ATIV
+    """
+    for linha in conteudo.splitlines():
+        campos = _split_sped(linha)
+        if not campos:
+            continue
+        if campos[0] == "0000":
+            try:
+                cnpj_raw  = campos[8]  if len(campos) > 8  else ""
+                nome_raw  = campos[7]  if len(campos) > 7  else ""
+                dt_ini    = campos[5]  if len(campos) > 5  else ""
+                dt_fin    = campos[6]  if len(campos) > 6  else ""
+                uf        = campos[10] if len(campos) > 10 else ""
+                ie        = campos[11] if len(campos) > 11 else ""
+                cod_mun   = campos[12] if len(campos) > 12 else ""
+
+                cnpj_limpo = limpar_cnpj(cnpj_raw)
+
+                if len(cnpj_limpo) != 14:
+                    log.append(
+                        f"AVISO: CNPJ encontrado no registro 0000 ('{cnpj_raw}') "
+                        "não tem 14 dígitos. Verifique o arquivo SPED."
+                    )
+                else:
+                    log.append(
+                        f"Empresa identificada no SPED → "
+                        f"CNPJ: {cnpj_limpo} | Nome: {nome_raw}"
+                    )
+
+                return {
+                    "cnpj":    cnpj_limpo,
+                    "nome":    nome_raw,
+                    "dt_ini":  dt_ini,
+                    "dt_fin":  dt_fin,
+                    "uf":      uf,
+                    "ie":      ie,
+                    "cod_mun": cod_mun,
+                }
+            except (IndexError, Exception) as e:
+                log.append(f"ERRO ao ler registro 0000 do SPED: {e}")
+                return None
+
+    log.append("ERRO: Registro 0000 não encontrado no arquivo SPED Fiscal.")
+    return None
+
+
 def extrair_participantes_sped(conteudo: str) -> list[dict]:
+    """
+    Extrai registros 0150 do SPED Fiscal.
+    |0150|COD_PART|NOME|COD_PAIS|CNPJ|CPF|IE|COD_MUN|SUFRAMA|END|NUM|COMPL|BAIRRO|
+    """
     participantes = []
     for linha in conteudo.splitlines():
-        linha = linha.strip()
-        campos = linha.split("|")
-        if campos and campos[0] == "":
-            campos = campos[1:]
-        if campos and campos[-1] == "":
-            campos = campos[:-1]
+        campos = _split_sped(linha)
         if not campos:
             continue
         if campos[0] == "0150":
@@ -236,10 +318,15 @@ def extrair_participantes_sped(conteudo: str) -> list[dict]:
 # ==============================
 
 def gerar_linha_0000(cnpj_empresa: str, nome_empresa: str) -> str:
+    """
+    Registro 0000 — Identificação da empresa.
+    CNPJ e Nome extraídos do próprio registro 0000 do SPED Fiscal.
+    """
     return f"0000|{limpar_cnpj(cnpj_empresa)}|\n"
 
 
-def _campos_endereco(dados_api: dict, dados_sped: dict, exterior: bool, usar_sped: bool) -> dict:
+def _campos_endereco(dados_api: dict, dados_sped: dict,
+                     exterior: bool, usar_sped: bool) -> dict:
     if exterior:
         return {
             "logradouro":  dados_sped.get("end",    "") or "",
@@ -268,14 +355,16 @@ def _campos_endereco(dados_api: dict, dados_sped: dict, exterior: bool, usar_spe
             "numero":      dados_api.get("numero",      dados_sped.get("num",    "")) or "",
             "complemento": dados_api.get("complemento", dados_sped.get("compl",  "")) or "",
             "bairro":      dados_api.get("bairro",      dados_sped.get("bairro", "")) or "",
-            "cod_mun":     str(dados_api.get("codigo_municipio", dados_sped.get("cod_mun", "")) or ""),
+            "cod_mun":     str(dados_api.get("codigo_municipio",
+                               dados_sped.get("cod_mun", "")) or ""),
             "uf":          dados_api.get("uf", "") or "",
             "cod_pais":    "",
             "cep":         re.sub(r"\D", "", dados_api.get("cep", "") or ""),
         }
 
 
-def _campos_comuns(dados_api: dict, dados_sped: dict, exterior: bool, usar_sped: bool) -> dict:
+def _campos_comuns(dados_api: dict, dados_sped: dict,
+                   exterior: bool, usar_sped: bool) -> dict:
     if exterior or usar_sped:
         return {
             "cnpj":     limpar_cnpj(dados_sped.get("cnpj", "")) if not exterior else "",
@@ -292,7 +381,8 @@ def _campos_comuns(dados_api: dict, dados_sped: dict, exterior: bool, usar_sped:
     else:
         return {
             "cnpj":     limpar_cnpj(dados_api.get("cnpj", dados_sped.get("cnpj", ""))),
-            "razao":    (dados_api.get("razao_social", dados_sped.get("nome", "")) or "")[:150],
+            "razao":    (dados_api.get("razao_social",
+                         dados_sped.get("nome", "")) or "")[:150],
             "fantasia": (dados_api.get("nome_fantasia", "") or "")[:40],
             "ie":       dados_sped.get("ie", "") or "",
             "suframa":  dados_sped.get("suframa", "") or "",
@@ -301,7 +391,8 @@ def _campos_comuns(dados_api: dict, dados_sped: dict, exterior: bool, usar_sped:
             "ddd_fax":  (dados_api.get("ddd_fax", "") or "")[:2],
             "fax":      dados_api.get("fax", "") or "",
             "data_cad": formatar_data(dados_api.get("data_inicio_atividade", "")),
-            "nat_jur":  mapear_natureza_juridica(dados_api.get("codigo_natureza_juridica")),
+            "nat_jur":  mapear_natureza_juridica(
+                            dados_api.get("codigo_natureza_juridica")),
             "regime":   mapear_porte(dados_api.get("porte", "")),
             "email":    dados_api.get("email", "") or "",
         }
@@ -342,32 +433,53 @@ def gerar_linha_0020(dados_api, dados_sped, exterior, usar_sped) -> str:
 # PROCESSAMENTO PRINCIPAL
 # ==============================
 
-def processar_sped(conteudo_sped, cnpj_empresa, nome_empresa,
-                   gerar_0010, gerar_0020, delay_api, log):
+def processar_sped(conteudo_sped: str, gerar_0010: bool,
+                   gerar_0020: bool, delay_api: float,
+                   log: list) -> tuple:
     """
-    Processa o SPED, consulta a API e monta as linhas do arquivo Domínio.
-    Retorna (linhas_saida, dados_tabela, contadores) ou (None, None, None) em caso de erro.
+    1. Lê o registro 0000 do SPED → CNPJ e Nome da empresa (sem input manual).
+    2. Lê os registros 0150 → participantes.
+    3. Consulta a API para cada CNPJ nacional ativo.
+    4. Monta as linhas do arquivo Domínio.
+    Retorna (linhas_saida, dados_tabela, contadores, cabecalho) ou
+            (None, None, None, None) em caso de erro.
     """
+
+    # ── 1. Cabeçalho da empresa (registro 0000 do SPED) ───────────────
+    cabecalho = extrair_cabecalho_sped(conteudo_sped, log)
+    if cabecalho is None:
+        return None, None, None, None
+
+    cnpj_empresa = cabecalho["cnpj"]
+    nome_empresa = cabecalho["nome"]
+
+    if not cnpj_empresa:
+        log.append("ERRO: CNPJ da empresa não encontrado no registro 0000 do SPED.")
+        return None, None, None, None
+
+    # ── 2. Participantes (registros 0150) ─────────────────────────────
     participantes = extrair_participantes_sped(conteudo_sped)
     total = len(participantes)
 
     if total == 0:
-        log.append("ERRO: Nenhum registro 0150 encontrado no arquivo SPED informado.")
-        return None, None, None
+        log.append("ERRO: Nenhum registro 0150 encontrado no arquivo SPED.")
+        return None, None, None, None
 
     log.append(f"{total} participante(s) encontrado(s) no registro 0150.")
 
+    # ── 3. Inicializa estruturas ───────────────────────────────────────
     linhas_saida = [gerar_linha_0000(cnpj_empresa, nome_empresa)]
     dados_tabela = []
     contadores   = {
         "api_ativa": 0, "baixada": 0, "inapta": 0,
-        "suspensa": 0,  "nula": 0,    "sem_api": 0,
-        "cpf_sped": 0,  "exterior": 0,
+        "suspensa":  0, "nula":    0, "sem_api": 0,
+        "cpf_sped":  0, "exterior": 0,
     }
 
     progresso = st.progress(0, text="Iniciando...")
     log_area  = st.empty()
 
+    # ── 4. Processa cada participante ─────────────────────────────────
     for idx, part in enumerate(participantes):
         pct      = int((idx + 1) / total * 100)
         cnpj_raw = limpar_cnpj(part["cnpj"])
@@ -376,7 +488,7 @@ def processar_sped(conteudo_sped, cnpj_empresa, nome_empresa,
         progresso.progress(
             pct,
             text=f"Processando {idx+1}/{total}: "
-                 f"{'🌍 EXTERIOR' if exterior else cnpj_raw or 'CPF'}"
+                 f"{'🌍 EXTERIOR' if exterior else cnpj_raw or 'CPF'}",
         )
 
         dados_api     = {}
@@ -389,7 +501,9 @@ def processar_sped(conteudo_sped, cnpj_empresa, nome_empresa,
             usar_sped    = True
             status_label = f"🌍 Exterior (COD_PAIS={part['cod_pais']})"
             contadores["exterior"] += 1
-            log.append(f"[{idx+1:03d}/{total}] {part['nome'][:40]} | {status_label}")
+            log.append(
+                f"[{idx+1:03d}/{total}] {part['nome'][:40]} | {status_label}"
+            )
 
         elif len(cnpj_raw) == 14:
             dados_api_bruto = consultar_cnpj(cnpj_raw)
@@ -397,9 +511,14 @@ def processar_sped(conteudo_sped, cnpj_empresa, nome_empresa,
 
             if dados_api_bruto is None:
                 usar_sped    = True
-                status_label = f"⚠️ {cnpj_raw} — sem resposta da API. Usando dados do SPED."
+                status_label = (
+                    f"⚠️ {cnpj_raw} — sem resposta da API. "
+                    "Usando dados do SPED."
+                )
                 contadores["sem_api"] += 1
-                log.append(f"[{idx+1:03d}/{total}] {cnpj_raw} | {status_label}")
+                log.append(
+                    f"[{idx+1:03d}/{total}] {cnpj_raw} | {status_label}"
+                )
             else:
                 situacao_cod, situacao_desc = get_situacao_cadastral(dados_api_bruto)
                 icone = SITUACAO_ICONE.get(situacao_cod, "❓")
@@ -408,7 +527,10 @@ def processar_sped(conteudo_sped, cnpj_empresa, nome_empresa,
                     dados_api    = dados_api_bruto
                     usar_sped    = False
                     razao_final  = dados_api.get("razao_social", part["nome"])
-                    status_label = f"✅ {cnpj_raw} — ATIVA. Dados da Receita Federal."
+                    status_label = (
+                        f"✅ {cnpj_raw} — ATIVA. "
+                        "Dados da Receita Federal."
+                    )
                     contadores["api_ativa"] += 1
                 else:
                     usar_sped    = True
@@ -416,23 +538,35 @@ def processar_sped(conteudo_sped, cnpj_empresa, nome_empresa,
                         f"{icone} {cnpj_raw} — {situacao_desc} "
                         f"(sit. {situacao_cod}). Usando dados do SPED."
                     )
-                    if situacao_cod == 8: contadores["baixada"]  += 1
+                    if situacao_cod == 8:   contadores["baixada"]  += 1
                     elif situacao_cod == 4: contadores["inapta"]   += 1
                     elif situacao_cod == 3: contadores["suspensa"]  += 1
                     elif situacao_cod == 1: contadores["nula"]      += 1
                     else:                  contadores["sem_api"]   += 1
 
-                log.append(f"[{idx+1:03d}/{total}] {cnpj_raw} | {razao_final[:40]} | {status_label}")
+                log.append(
+                    f"[{idx+1:03d}/{total}] {cnpj_raw} | "
+                    f"{razao_final[:40]} | {status_label}"
+                )
         else:
             usar_sped    = True
-            status_label = f"ℹ️ {cnpj_raw or limpar_cnpj(part['cpf'])} — CPF/sem CNPJ. Usando dados do SPED."
+            status_label = (
+                f"ℹ️ {cnpj_raw or limpar_cnpj(part['cpf'])} — "
+                "CPF/sem CNPJ. Usando dados do SPED."
+            )
             contadores["cpf_sped"] += 1
-            log.append(f"[{idx+1:03d}/{total}] {part['nome'][:40]} | {status_label}")
+            log.append(
+                f"[{idx+1:03d}/{total}] {part['nome'][:40]} | {status_label}"
+            )
 
         if gerar_0010:
-            linhas_saida.append(gerar_linha_0010(dados_api, part, exterior, usar_sped))
+            linhas_saida.append(
+                gerar_linha_0010(dados_api, part, exterior, usar_sped)
+            )
         if gerar_0020:
-            linhas_saida.append(gerar_linha_0020(dados_api, part, exterior, usar_sped))
+            linhas_saida.append(
+                gerar_linha_0020(dados_api, part, exterior, usar_sped)
+            )
 
         dados_tabela.append({
             "COD_PART":           part["cod_part"],
@@ -454,6 +588,7 @@ def processar_sped(conteudo_sped, cnpj_empresa, nome_empresa,
     progresso.progress(100, text="✅ Concluído!")
     log.append(
         f"Arquivo gerado com {len(linhas_saida) - 1} registro(s). "
+        f"Empresa: {nome_empresa} | CNPJ: {cnpj_empresa} | "
         f"Ativos(API)={contadores['api_ativa']} | "
         f"Baixados={contadores['baixada']} | "
         f"Inaptos={contadores['inapta']} | "
@@ -461,7 +596,7 @@ def processar_sped(conteudo_sped, cnpj_empresa, nome_empresa,
         f"Exterior={contadores['exterior']} | "
         f"CPF/SemAPI={contadores['cpf_sped'] + contadores['sem_api']}"
     )
-    return linhas_saida, dados_tabela, contadores
+    return linhas_saida, dados_tabela, contadores, cabecalho
 
 
 # ==============================
@@ -482,12 +617,17 @@ def main():
         f"""
         <div style="background:#444444; padding:24px 28px 18px 28px; border-radius:8px;
                     border-top:6px solid #FF8000; margin-bottom:28px;">
-            <h2 style="color:#FF8000; margin:0; font-family:'Segoe UI',Arial,sans-serif;">
-                🏢 Importação de Clientes e Fornecedores — SPED → Domínio &nbsp;|&nbsp; {VERSAO}
+            <h2 style="color:#FF8000; margin:0;
+                       font-family:'Segoe UI',Arial,sans-serif;">
+                🏢 Importação de Clientes e Fornecedores
+                — SPED → Domínio &nbsp;|&nbsp; {VERSAO}
             </h2>
-            <p style="color:#DDDDDD; margin:6px 0 0 0; font-family:'Segoe UI',Arial,sans-serif;">
-                Faça o upload do SPED Fiscal, preencha os dados da empresa e clique em
-                <strong>Gerar arquivo Domínio</strong>.
+            <p style="color:#DDDDDD; margin:6px 0 0 0;
+                      font-family:'Segoe UI',Arial,sans-serif;">
+                Faça o upload do SPED Fiscal e clique em
+                <strong>▶ Gerar arquivo Domínio</strong>.
+                O CNPJ e o nome da empresa são lidos automaticamente
+                do registro <strong>0000</strong> do SPED.
             </p>
         </div>
         """,
@@ -498,15 +638,6 @@ def main():
     with st.sidebar:
         st.markdown("### ⚙️ Configurações")
 
-        cnpj_empresa = st.text_input(
-            "CNPJ da Empresa (apenas números)",
-            max_chars=14,
-            help="CNPJ da empresa geradora do arquivo (registro 0000).",
-        )
-        nome_empresa = st.text_input(
-            "Nome / Razão Social da Empresa",
-            help="Nome da empresa para o registro 0000.",
-        )
         tipo_registro = st.radio(
             "Gerar registros como:",
             options=["Clientes (0010)", "Fornecedores (0020)", "Ambos (0010 e 0020)"],
@@ -532,31 +663,30 @@ def main():
         st.markdown("**Domínio Sistemas**")
 
     # ── Instruções ────────────────────────────────────────────────────
-    with st.expander("📖 **Instruções de Uso** — clique para expandir", expanded=False):
+    with st.expander(
+        "📖 **Instruções de Uso** — clique para expandir", expanded=False
+    ):
         st.markdown(
             """
             <div class="instrucoes-box">
 
             <h4>🔹 Passo 1 — Exportar o SPED Fiscal</h4>
             <p>Exporte o arquivo <b>SPED Fiscal (.txt)</b> do sistema de origem.
-            O arquivo deve conter os registros <b>0150</b> (cadastro de participantes).</p>
+            O arquivo deve conter o registro <b>0000</b> (identificação da empresa)
+            e os registros <b>0150</b> (cadastro de participantes).</p>
 
-            <h4>🔹 Passo 2 — Preencher os dados da empresa</h4>
-            <p>Na barra lateral, informe o <b>CNPJ</b> e a <b>Razão Social</b> da empresa
-            que está gerando o arquivo de importação (registro 0000).</p>
+            <h4>🔹 Passo 2 — Selecionar o tipo de registro</h4>
+            <p>Na barra lateral, escolha se deseja gerar registros de
+            <b>Clientes (0010)</b>, <b>Fornecedores (0020)</b> ou <b>Ambos</b>.</p>
 
-            <h4>🔹 Passo 3 — Selecionar o tipo de registro</h4>
-            <p>Escolha se deseja gerar registros de <b>Clientes (0010)</b>,
-            <b>Fornecedores (0020)</b> ou <b>Ambos</b>.</p>
-
-            <h4>🔹 Passo 4 — Fazer upload e gerar o arquivo</h4>
+            <h4>🔹 Passo 3 — Fazer upload e gerar o arquivo</h4>
             <ol>
-                <li>Clique em <b>Browse files</b> e selecione o arquivo SPED Fiscal (.txt).</li>
+                <li>Clique em <b>Browse files</b> e selecione o SPED Fiscal (.txt).</li>
                 <li>Clique em <b>▶ Gerar arquivo Domínio</b>.</li>
                 <li>Aguarde o processamento e clique em <b>⬇ Baixar arquivo TXT</b>.</li>
             </ol>
 
-            <h4>🔹 Passo 5 — Importar no Domínio Sistemas</h4>
+            <h4>🔹 Passo 4 — Importar no Domínio Sistemas</h4>
             <p>No Domínio, acesse <b>Utilitários → Importação → Importação Padrão →
             Leiaute Domínio Sistemas com Separador</b> e selecione o arquivo gerado.</p>
 
@@ -564,15 +694,23 @@ def main():
 
             <h4>⚠ Observações importantes</h4>
             <ul>
-                <li><b>CNPJ Ativo</b>: dados atualizados da <b>Receita Federal</b> via API pública.</li>
-                <li><b>CNPJ Baixado / Inapto / Suspenso / Nulo</b>: dados do <b>SPED Fiscal</b>.</li>
-                <li><b>Participantes do Exterior</b> (COD_PAIS ≠ 1058): dados do <b>SPED Fiscal</b>;
+                <li>O <b>CNPJ e o nome da empresa</b> são lidos automaticamente do
+                    registro <b>0000</b> do SPED Fiscal — não é necessário
+                    preenchimento manual.</li>
+                <li><b>CNPJ Ativo</b>: dados atualizados da
+                    <b>Receita Federal</b> via API pública.</li>
+                <li><b>CNPJ Baixado / Inapto / Suspenso / Nulo</b>:
+                    dados do <b>SPED Fiscal</b>.</li>
+                <li><b>Participantes do Exterior</b> (COD_PAIS ≠ 1058):
+                    dados do <b>SPED Fiscal</b>;
                     COD_MUN e UF preenchidos como <code>EX</code>.</li>
-                <li><b>CPF / sem inscrição</b>: dados do <b>SPED Fiscal</b>, sem consulta à API.</li>
-                <li>O separador utilizado é o caractere <code>|</code> (pipe), conforme
-                    leiaute Domínio Sistemas.</li>
-                <li>A API utilizada é a <b>minhareceita.org</b> (gratuita, sem autenticação).
-                    Use o slider para ajustar o intervalo entre consultas e evitar bloqueios.</li>
+                <li><b>CPF / sem inscrição</b>: dados do <b>SPED Fiscal</b>,
+                    sem consulta à API.</li>
+                <li>O separador utilizado é o caractere <code>|</code> (pipe),
+                    conforme leiaute Domínio Sistemas.</li>
+                <li>A API utilizada é a <b>minhareceita.org</b>
+                    (gratuita, sem autenticação). Use o slider para ajustar
+                    o intervalo entre consultas e evitar bloqueios.</li>
             </ul>
 
             </div>
@@ -583,32 +721,39 @@ def main():
     st.markdown("---")
 
     # ── Session state ─────────────────────────────────────────────────
-    if "log"          not in st.session_state: st.session_state.log          = [f"Aplicação pronta. Versão: {VERSAO}"]
-    if "txt_gerado"   not in st.session_state: st.session_state.txt_gerado   = None
-    if "nome_arquivo" not in st.session_state: st.session_state.nome_arquivo = "dominio_separador.txt"
-    if "dados_tabela" not in st.session_state: st.session_state.dados_tabela = None
-    if "contadores"   not in st.session_state: st.session_state.contadores   = None
+    if "log"          not in st.session_state:
+        st.session_state.log          = [f"Aplicação pronta. Versão: {VERSAO}"]
+    if "txt_gerado"   not in st.session_state:
+        st.session_state.txt_gerado   = None
+    if "nome_arquivo" not in st.session_state:
+        st.session_state.nome_arquivo = "dominio_separador.txt"
+    if "dados_tabela" not in st.session_state:
+        st.session_state.dados_tabela = None
+    if "contadores"   not in st.session_state:
+        st.session_state.contadores   = None
+    if "cabecalho"    not in st.session_state:
+        st.session_state.cabecalho    = None
 
     # ── Upload ────────────────────────────────────────────────────────
     arquivo_sped = st.file_uploader(
         "Arquivo SPED Fiscal (.txt)",
         type=["txt"],
-        help="Selecione o arquivo de texto do SPED Fiscal contendo os registros 0150.",
+        help=(
+            "Selecione o arquivo de texto do SPED Fiscal. "
+            "O CNPJ da empresa será lido automaticamente do registro 0000."
+        ),
     )
 
     col1, col2 = st.columns([1, 1])
     with col1:
         gerar = st.button(
             "▶ Gerar arquivo Domínio",
-            disabled=(arquivo_sped is None or not cnpj_empresa or not nome_empresa),
+            disabled=(arquivo_sped is None),
             use_container_width=True,
             type="primary",
         )
     with col2:
         limpar = st.button("🗑 Limpar", use_container_width=True)
-
-    if not cnpj_empresa or not nome_empresa:
-        st.warning("⚠️ Preencha o **CNPJ** e o **Nome da Empresa** na barra lateral para habilitar a geração.")
 
     if limpar:
         st.session_state.log          = ["Campos limpos."]
@@ -616,6 +761,7 @@ def main():
         st.session_state.nome_arquivo = "dominio_separador.txt"
         st.session_state.dados_tabela = None
         st.session_state.contadores   = None
+        st.session_state.cabecalho    = None
         st.rerun()
 
     # ── Processamento ─────────────────────────────────────────────────
@@ -624,27 +770,52 @@ def main():
         st.session_state.txt_gerado   = None
         st.session_state.dados_tabela = None
         st.session_state.contadores   = None
+        st.session_state.cabecalho    = None
 
         conteudo_sped = arquivo_sped.read().decode("latin-1", errors="replace")
         gerar_0010    = "0010" in tipo_registro or "Ambos" in tipo_registro
         gerar_0020    = "0020" in tipo_registro or "Ambos" in tipo_registro
 
-        linhas, dados_tabela, contadores = processar_sped(
-            conteudo_sped, cnpj_empresa, nome_empresa,
-            gerar_0010, gerar_0020, delay_api,
-            st.session_state.log,
+        linhas, dados_tabela, contadores, cabecalho = processar_sped(
+            conteudo_sped, gerar_0010, gerar_0020,
+            delay_api, st.session_state.log,
         )
 
-        if linhas and not any(str(l).startswith("ERRO") for l in st.session_state.log):
+        if linhas and not any(
+            str(l).startswith("ERRO") for l in st.session_state.log
+        ):
             conteudo_saida = "".join(linhas)
-            st.session_state.txt_gerado   = conteudo_saida.encode("latin-1", errors="replace")
+            st.session_state.txt_gerado   = conteudo_saida.encode(
+                "latin-1", errors="replace"
+            )
+            cnpj_arq = cabecalho["cnpj"] if cabecalho else "empresa"
             st.session_state.nome_arquivo = (
-                f"dominio_separador_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                f"dominio_separador_{cnpj_arq}_"
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             )
             st.session_state.dados_tabela = dados_tabela
             st.session_state.contadores   = contadores
+            st.session_state.cabecalho    = cabecalho
 
         st.rerun()
+
+    # ── Exibe dados da empresa lidos do SPED ──────────────────────────
+    if st.session_state.cabecalho:
+        cab = st.session_state.cabecalho
+        st.markdown(
+            f"""
+            <div style="background:#FFF8F0; border-left:4px solid #FF8000;
+                        border-radius:4px; padding:12px 18px; margin-bottom:16px;
+                        font-family:'Segoe UI',Arial,sans-serif; color:#444;">
+                <b>🏢 Empresa identificada no SPED Fiscal (registro 0000)</b><br>
+                <b>CNPJ:</b> {cab['cnpj']} &nbsp;|&nbsp;
+                <b>Nome:</b> {cab['nome']} &nbsp;|&nbsp;
+                <b>UF:</b> {cab['uf']} &nbsp;|&nbsp;
+                <b>Período:</b> {cab['dt_ini']} a {cab['dt_fin']}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     # ── Download + resultado ──────────────────────────────────────────
     if st.session_state.txt_gerado is not None:
@@ -690,40 +861,64 @@ def main():
                 use_container_width=True,
             )
 
-            # Expanders de alerta
-            baixados  = [r for r in st.session_state.dados_tabela if "BAIXADA"  in r["Status"]]
-            inaptos   = [r for r in st.session_state.dados_tabela if "INAPTA"   in r["Status"]]
-            suspensos = [r for r in st.session_state.dados_tabela if "SUSPENSA" in r["Status"]]
+            # Expanders de alerta por situação
+            baixados  = [r for r in st.session_state.dados_tabela
+                         if "BAIXADA"  in r["Status"]]
+            inaptos   = [r for r in st.session_state.dados_tabela
+                         if "INAPTA"   in r["Status"]]
+            suspensos = [r for r in st.session_state.dados_tabela
+                         if "SUSPENSA" in r["Status"]]
 
             if baixados:
-                with st.expander(f"❌ {len(baixados)} CNPJ(s) BAIXADO(s) — dados do SPED utilizados"):
+                with st.expander(
+                    f"❌ {len(baixados)} CNPJ(s) BAIXADO(s) "
+                    "— dados do SPED utilizados"
+                ):
                     st.dataframe(
-                        pd.DataFrame(baixados)[["COD_PART", "CNPJ/CPF", "Nome (SPED)"]],
+                        pd.DataFrame(baixados)[
+                            ["COD_PART", "CNPJ/CPF", "Nome (SPED)"]
+                        ],
                         use_container_width=True,
                     )
             if inaptos:
-                with st.expander(f"⛔ {len(inaptos)} CNPJ(s) INAPTO(s) — dados do SPED utilizados"):
+                with st.expander(
+                    f"⛔ {len(inaptos)} CNPJ(s) INAPTO(s) "
+                    "— dados do SPED utilizados"
+                ):
                     st.dataframe(
-                        pd.DataFrame(inaptos)[["COD_PART", "CNPJ/CPF", "Nome (SPED)"]],
+                        pd.DataFrame(inaptos)[
+                            ["COD_PART", "CNPJ/CPF", "Nome (SPED)"]
+                        ],
                         use_container_width=True,
                     )
             if suspensos:
-                with st.expander(f"⚠️ {len(suspensos)} CNPJ(s) SUSPENSO(s) — dados do SPED utilizados"):
+                with st.expander(
+                    f"⚠️ {len(suspensos)} CNPJ(s) SUSPENSO(s) "
+                    "— dados do SPED utilizados"
+                ):
                     st.dataframe(
-                        pd.DataFrame(suspensos)[["COD_PART", "CNPJ/CPF", "Nome (SPED)"]],
+                        pd.DataFrame(suspensos)[
+                            ["COD_PART", "CNPJ/CPF", "Nome (SPED)"]
+                        ],
                         use_container_width=True,
                     )
 
-            with st.expander("👁️ Prévia do arquivo gerado (primeiras 30 linhas)"):
+            with st.expander(
+                "👁️ Prévia do arquivo gerado (primeiras 30 linhas)"
+            ):
                 preview = "".join(
-                    st.session_state.txt_gerado.decode("latin-1", errors="replace").splitlines(True)[:30]
+                    st.session_state.txt_gerado
+                    .decode("latin-1", errors="replace")
+                    .splitlines(True)[:30]
                 )
                 st.code(preview, language="text")
 
     # ── Log de processamento ──────────────────────────────────────────
     st.markdown("**Log de processamento**")
     log_texto = "\n".join(st.session_state.log)
-    tem_erro  = any(str(l).startswith("ERRO") for l in st.session_state.log)
+    tem_erro  = any(
+        str(l).startswith("ERRO") for l in st.session_state.log
+    )
     cor_borda = "#D32F2F" if tem_erro else "#388E3C"
 
     st.markdown(
