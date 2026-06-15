@@ -1,5 +1,5 @@
 # ============================================================
-# app_sped_dominio.py  –  SPED Fiscal → Domínio Sistemas V2.1
+# app_sped_dominio.py  –  SPED Fiscal → Domínio Sistemas V2.2
 # Dependências: streamlit, requests, pandas
 # pip install streamlit requests pandas
 # ============================================================
@@ -10,7 +10,7 @@ import time
 import re
 from datetime import datetime
 
-VERSAO = "V2.1"
+VERSAO = "V2.2"
 COD_PAIS_BRASIL = {"1058", "01058"}
 SITUACAO_ATIVA  = 2
 SITUACOES_DESCRICAO = {1: "NULA", 2: "ATIVA", 3: "SUSPENSA", 4: "INAPTA", 8: "BAIXADA"}
@@ -470,7 +470,7 @@ def gerar_linha_0020(dados_api: dict, dados_sped: dict,
 
 
 # ==============================
-# PROCESSAMENTO PRINCIPAL
+# PROCESSAMENTO — MODO SPED
 # ==============================
 def processar_sped(conteudo_sped: str, modo: str,
                    delay_api: float, log: list) -> tuple:
@@ -675,6 +675,158 @@ def processar_sped(conteudo_sped: str, modo: str,
 
 
 # ==============================
+# PROCESSAMENTO — MODO CNPJ AVULSO
+# ==============================
+def _sped_vazio() -> dict:
+    """Retorna um dict de participante SPED com todos os campos vazios."""
+    return {
+        "cod_part": "", "nome": "", "cod_pais": "1058",
+        "cnpj": "", "cpf": "", "ie": "", "cod_mun": "",
+        "suframa": "", "end": "", "num": "", "compl": "", "bairro": "",
+    }
+
+
+def processar_cnpjs_avulsos(
+    lista_cnpjs: list[str],
+    cnpj_empresa: str,
+    modo: str,
+    delay_api: float,
+    log: list,
+) -> tuple:
+    """
+    Consulta cada CNPJ da lista na Receita Federal e gera o arquivo
+    Domínio no mesmo leiaute de _processar_sped_.
+
+    modo = "clientes"     → gera só 0010
+         = "fornecedores" → gera só 0020
+         = "ambos"        → gera 0010 e 0020
+    """
+    total        = len(lista_cnpjs)
+    linhas_saida = [gerar_linha_0000(cnpj_empresa)]
+    dados_tabela = []
+    contadores   = {
+        "api_ativa": 0, "baixada": 0, "inapta": 0,
+        "suspensa":  0, "nula":    0, "sem_api": 0,
+        "cpf_sped":  0, "exterior": 0,
+    }
+
+    e_cliente    = modo in ("clientes",    "ambos")
+    e_fornecedor = modo in ("fornecedores","ambos")
+    papel = {
+        "clientes":     "🛒 Cliente",
+        "fornecedores": "🏭 Fornecedor",
+        "ambos":        "🔄 Ambos",
+    }.get(modo, "🔄 Ambos")
+
+    progresso = st.progress(0, text="Iniciando...")
+    log_area  = st.empty()
+
+    for idx, cnpj_raw in enumerate(lista_cnpjs):
+        pct = int((idx + 1) / total * 100)
+        progresso.progress(pct, text=f"Consultando {idx+1}/{total}: {cnpj_raw}")
+
+        dados_api  = {}
+        usar_sped  = False          # aqui "sped" = fallback vazio
+        part       = _sped_vazio()
+        part["cnpj"] = cnpj_raw     # garante que a inscrição seja preenchida
+
+        situacao_desc = ""
+        status_label  = ""
+        razao_final   = ""
+        cod_mun_log   = ""
+
+        dados_api_bruto = consultar_cnpj(cnpj_raw)
+        time.sleep(delay_api)
+
+        if dados_api_bruto is None:
+            # Sem resposta: grava só o CNPJ, campos em branco
+            usar_sped    = True
+            status_label = f"⚠️ {cnpj_raw} — sem resposta da API. Campos em branco."
+            razao_final  = cnpj_raw
+            contadores["sem_api"] += 1
+
+        else:
+            situacao_cod, situacao_desc = get_situacao_cadastral(dados_api_bruto)
+            icone = SITUACAO_ICONE.get(situacao_cod, "❓")
+
+            if situacao_cod == SITUACAO_ATIVA:
+                dados_api   = dados_api_bruto
+                usar_sped   = False
+                razao_final = dados_api.get("razao_social", cnpj_raw)
+                cod_mun_log = extrair_cod_ibge(dados_api)
+                status_label = (
+                    f"✅ {cnpj_raw} — ATIVA | "
+                    f"Município IBGE (API): {cod_mun_log}"
+                )
+                contadores["api_ativa"] += 1
+            else:
+                # Não ativo: grava CNPJ + dados parciais da API mesmo assim
+                dados_api   = dados_api_bruto
+                usar_sped   = False          # usa o que a API retornou
+                razao_final = dados_api.get("razao_social", cnpj_raw)
+                cod_mun_log = extrair_cod_ibge(dados_api)
+                status_label = (
+                    f"{icone} {cnpj_raw} — {situacao_desc} "
+                    f"(sit. {situacao_cod}). Dados da API utilizados."
+                )
+                if   situacao_cod == 8: contadores["baixada"]  += 1
+                elif situacao_cod == 4: contadores["inapta"]   += 1
+                elif situacao_cod == 3: contadores["suspensa"]  += 1
+                elif situacao_cod == 1: contadores["nula"]      += 1
+                else:                  contadores["sem_api"]   += 1
+
+        log.append(
+            f"[{idx+1:03d}/{total}] {cnpj_raw} | "
+            f"{razao_final[:30]} | {papel} | {status_label}"
+        )
+
+        if e_cliente:
+            linhas_saida.append(
+                gerar_linha_0010(dados_api, part, False, usar_sped)
+            )
+        if e_fornecedor:
+            linhas_saida.append(
+                gerar_linha_0020(dados_api, part, False, usar_sped)
+            )
+
+        dados_tabela.append({
+            "COD_PART":             f"{idx+1:04d}",
+            "CNPJ/CPF":             cnpj_raw,
+            "Nome (SPED)":          "—",
+            "Razão Social (API)":   dados_api.get("razao_social", ""),
+            "Município IBGE (c09)": cod_mun_log,
+            "Apelido":              razao_final[:40],
+            "Papel":                papel,
+            "Situação Receita":     situacao_desc or "—",
+            "COD_PAIS":             "1058",
+            "Fonte":                "Receita Federal" if not usar_sped else "Sem API",
+            "Status":               status_label,
+        })
+
+        log_area.text_area(
+            "Log de processamento",
+            value="\n".join(log[-20:]),
+            height=200,
+        )
+
+    progresso.progress(100, text="✅ Concluído!")
+    log.append(
+        f"Arquivo gerado com {len(linhas_saida) - 1} registro(s) | "
+        f"Ativos(API)={contadores['api_ativa']} | "
+        f"Baixados={contadores['baixada']} | "
+        f"Inaptos={contadores['inapta']} | "
+        f"Suspensos={contadores['suspensa']} | "
+        f"SemAPI={contadores['sem_api']}"
+    )
+
+    cabecalho_fake = {
+        "cnpj": cnpj_empresa, "nome": "Entrada manual de CNPJs",
+        "dt_ini": "", "dt_fin": "", "uf": "", "ie": "", "cod_mun": "",
+    }
+    return linhas_saida, dados_tabela, contadores, cabecalho_fake
+
+
+# ==============================
 # INTERFACE STREAMLIT
 # ==============================
 def main():
@@ -698,9 +850,8 @@ def main():
             </h2>
             <p style="color:#DDDDDD; margin:6px 0 0 0;
                       font-family:'Segoe UI',Arial,sans-serif;">
-                Faça o upload do SPED Fiscal e clique em
-                <strong>▶ Gerar arquivo Domínio</strong>.
-                CNPJ, nome e classificação detectados automaticamente.
+                Faça o upload do SPED Fiscal <b>ou</b> cole CNPJs avulsos
+                e clique em <strong>▶ Gerar arquivo Domínio</strong>.
             </p>
         </div>
         """,
@@ -710,8 +861,9 @@ def main():
     # ── Sidebar ───────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("### ⚙️ Configurações")
-        modo = st.radio(
-            "Modo de classificação:",
+
+        modo_sped = st.radio(
+            "Classificação (modo SPED):",
             options=[
                 "🔍 Automático (por C100/D100)",
                 "🛒 Somente Clientes (0010)",
@@ -719,10 +871,26 @@ def main():
             ],
             index=0,
         )
+
+        st.markdown("---")
+
+        modo_avulso = st.radio(
+            "Classificação (modo CNPJs avulsos):",
+            options=[
+                "🛒 Somente Clientes (0010)",
+                "🏭 Somente Fornecedores (0020)",
+                "🔄 Ambos (0010 e 0020)",
+            ],
+            index=2,
+        )
+
+        st.markdown("---")
+
         delay_api = st.slider(
             "Intervalo entre consultas (s)",
             min_value=0.5, max_value=5.0, value=1.0, step=0.5,
         )
+
         st.markdown("---")
         st.markdown("### 📋 Situação Cadastral")
         for cod, desc in SITUACOES_DESCRICAO.items():
@@ -741,46 +909,32 @@ def main():
             """
             <div class="instrucoes-box">
 
-            <h4>🔹 Passo 1 — Exportar o SPED Fiscal</h4>
-            <p>Exporte o arquivo <b>SPED Fiscal (.txt)</b> do sistema de origem.
-            O arquivo deve conter o registro <b>0000</b> (empresa) e os registros
-            <b>0150</b> (participantes).</p>
+            <h4>🔹 Modo A — SPED Fiscal</h4>
+            <p>Exporte o <b>SPED Fiscal (.txt)</b> do sistema de origem (registros
+            <b>0000</b> e <b>0150</b> obrigatórios) e faça o upload na aba
+            <b>📂 SPED Fiscal</b>.</p>
 
-            <h4>🔹 Passo 2 — Selecionar o modo de classificação</h4>
-            <ul>
-                <li><b>🔍 Automático</b>: analisa C100/D100 — entrada=fornecedor, saída=cliente.</li>
-                <li><b>🛒 Somente Clientes</b>: gera apenas registros 0010.</li>
-                <li><b>🏭 Somente Fornecedores</b>: gera apenas registros 0020.</li>
-            </ul>
+            <h4>🔹 Modo B — CNPJs Avulsos</h4>
+            <p>Na aba <b>🔢 CNPJs Avulsos</b>, informe o <b>CNPJ da sua empresa</b>
+            (preenchimento obrigatório do registro 0000) e cole os CNPJs a importar
+            — um por linha, com ou sem pontuação. Os dados serão buscados
+            diretamente na <b>Receita Federal</b>.</p>
 
-            <h4>🔹 Passo 3 — Fazer upload e gerar o arquivo</h4>
-            <ol>
-                <li>Clique em <b>Browse files</b> e selecione o SPED Fiscal (.txt).</li>
-                <li>Clique em <b>▶ Gerar arquivo Domínio</b>.</li>
-                <li>Clique em <b>⬇ Baixar arquivo TXT</b>.</li>
-            </ol>
-
-            <h4>🔹 Passo 4 — Importar no Domínio Sistemas</h4>
-            <p>No Domínio: <b>Utilitários → Importação → Importação Padrão →
+            <h4>🔹 Passo final — Importar no Domínio Sistemas</h4>
+            <p><b>Utilitários → Importação → Importação Padrão →
             Leiaute Domínio Sistemas com Separador</b>.</p>
 
             <hr>
 
-            <h4>⚠ Observações importantes (V2.1)</h4>
+            <h4>⚠ Observações (V2.2)</h4>
             <ul>
                 <li><b>Campo 06 — Número do endereço</b>: valores não numéricos
-                    (<code>S/N</code>, <code>SN</code>, <code>s/n</code>, <code>-</code>)
-                    são substituídos por <b>vazio</b> — o campo é Numérico no leiaute.</li>
-                <li><b>Campo 09 — Código do município</b>:
-                    CNPJ ativo → <code>codigo_municipio_ibge</code> da Receita Federal
-                    (ex: <code>3550308</code>).
-                    Demais → <code>cod_mun</code> do SPED.
-                    Exterior → <code>EX</code>.</li>
-                <li><b>Campo 19 — Data do cadastro</b>: sempre <b>vazia</b> —
-                    evita o erro <i>"Não existem parâmetros para a vigência"</i>.</li>
-                <li><b>CNPJ Ativo</b>: dados da <b>Receita Federal</b>.</li>
-                <li><b>CNPJ Baixado/Inapto/Suspenso</b>: CNPJ + dados do <b>SPED</b>.</li>
-                <li><b>Exterior</b>: dados do SPED; campos 09 e 10 = <code>EX</code>.</li>
+                    são substituídos por <b>vazio</b>.</li>
+                <li><b>Campo 09 — Município IBGE</b>: sempre vindo da API
+                    quando o CNPJ é encontrado.</li>
+                <li><b>Campo 19 — Data do cadastro</b>: sempre <b>vazia</b>.</li>
+                <li>No modo avulso, CNPJs não encontrados na API recebem
+                    apenas a inscrição preenchida e demais campos em branco.</li>
             </ul>
 
             </div>
@@ -803,66 +957,211 @@ def main():
         if k not in st.session_state:
             st.session_state[k] = v
 
-    # ── Upload ────────────────────────────────────────────────────────
-    arquivo_sped = st.file_uploader(
-        "Arquivo SPED Fiscal (.txt)",
-        type=["txt"],
-        help="CNPJ da empresa e classificação detectados automaticamente.",
-    )
+    # ── Abas ─────────────────────────────────────────────────────────
+    aba_sped, aba_avulso = st.tabs(["📂 SPED Fiscal", "🔢 CNPJs Avulsos"])
 
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        gerar = st.button(
-            "▶ Gerar arquivo Domínio",
-            disabled=(arquivo_sped is None),
-            use_container_width=True,
-            type="primary",
+    # ════════════════════════════════════════════════════════════════
+    # ABA 1 — SPED FISCAL
+    # ════════════════════════════════════════════════════════════════
+    with aba_sped:
+        arquivo_sped = st.file_uploader(
+            "Arquivo SPED Fiscal (.txt)",
+            type=["txt"],
+            help="CNPJ da empresa e classificação detectados automaticamente.",
+            key="uploader_sped",
         )
-    with col2:
-        limpar = st.button("🗑 Limpar", use_container_width=True)
 
-    if limpar:
-        for k, v in defaults.items():
-            st.session_state[k] = v
-        st.session_state.log = ["Campos limpos."]
-        st.rerun()
-
-    # ── Processamento ─────────────────────────────────────────────────
-    if gerar and arquivo_sped is not None:
-        for k in defaults:
-            st.session_state[k] = (
-                ["Iniciando geração do arquivo..."] if k == "log" else None
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            gerar_sped = st.button(
+                "▶ Gerar arquivo Domínio",
+                disabled=(arquivo_sped is None),
+                use_container_width=True,
+                type="primary",
+                key="btn_gerar_sped",
+            )
+        with col2:
+            limpar_sped = st.button(
+                "🗑 Limpar",
+                use_container_width=True,
+                key="btn_limpar_sped",
             )
 
-        conteudo_sped = arquivo_sped.read().decode("latin-1", errors="replace")
-        modo_map = {
-            "🔍 Automático (por C100/D100)":  "auto",
-            "🛒 Somente Clientes (0010)":      "clientes",
-            "🏭 Somente Fornecedores (0020)":  "fornecedores",
-        }
-        modo_selecionado = modo_map.get(modo, "auto")
+        if limpar_sped:
+            for k, v in defaults.items():
+                st.session_state[k] = v
+            st.session_state.log = ["Campos limpos."]
+            st.rerun()
 
-        linhas, dados_tabela, contadores, cabecalho = processar_sped(
-            conteudo_sped, modo_selecionado,
-            delay_api, st.session_state.log,
+        if gerar_sped and arquivo_sped is not None:
+            for k in defaults:
+                st.session_state[k] = (
+                    ["Iniciando geração do arquivo..."] if k == "log" else None
+                )
+
+            conteudo_sped = arquivo_sped.read().decode("latin-1", errors="replace")
+            modo_map = {
+                "🔍 Automático (por C100/D100)":  "auto",
+                "🛒 Somente Clientes (0010)":      "clientes",
+                "🏭 Somente Fornecedores (0020)":  "fornecedores",
+            }
+            modo_selecionado = modo_map.get(modo_sped, "auto")
+
+            linhas, dados_tabela, contadores, cabecalho = processar_sped(
+                conteudo_sped, modo_selecionado,
+                delay_api, st.session_state.log,
+            )
+
+            tem_erro = any(str(l).startswith("ERRO") for l in st.session_state.log)
+
+            if linhas and not tem_erro:
+                st.session_state.txt_gerado = "".join(linhas).encode(
+                    "latin-1", errors="replace"
+                )
+                cnpj_arq = cabecalho["cnpj"] if cabecalho else "empresa"
+                st.session_state.nome_arquivo = (
+                    f"dominio_separador_{cnpj_arq}_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                )
+                st.session_state.dados_tabela = dados_tabela
+                st.session_state.contadores   = contadores
+                st.session_state.cabecalho    = cabecalho
+
+            st.rerun()
+
+    # ════════════════════════════════════════════════════════════════
+    # ABA 2 — CNPJs AVULSOS
+    # ════════════════════════════════════════════════════════════════
+    with aba_avulso:
+        st.markdown(
+            """
+            <div style="background:#FFF8F0; border-left:4px solid #FF8000;
+                        border-radius:4px; padding:10px 16px; margin-bottom:14px;
+                        font-family:'Segoe UI',Arial,sans-serif; color:#444;">
+                Cole os CNPJs abaixo — <b>um por linha</b>, com ou sem pontuação.
+                Os dados serão buscados diretamente na
+                <b>Receita Federal (minhareceita.org)</b>.
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-        tem_erro = any(str(l).startswith("ERRO") for l in st.session_state.log)
+        cnpj_empresa_avulso = st.text_input(
+            "🏢 CNPJ da sua empresa (obrigatório — preenche o registro 0000)",
+            placeholder="00.000.000/0000-00  ou  00000000000000",
+            key="cnpj_empresa_avulso",
+        )
 
-        if linhas and not tem_erro:
+        texto_cnpjs = st.text_area(
+            "📋 CNPJs a importar (um por linha)",
+            height=220,
+            placeholder=(
+                "11.222.333/0001-81\n"
+                "44555666000177\n"
+                "77.888.999/0001-00\n"
+                "..."
+            ),
+            key="textarea_cnpjs",
+        )
+
+        # Pré-visualização do que será processado
+        cnpjs_parsed = []
+        avisos_parse = []
+        if texto_cnpjs.strip():
+            vistos = set()
+            for i, linha in enumerate(texto_cnpjs.splitlines(), 1):
+                c = limpar_cnpj(linha)
+                if not c:
+                    continue
+                if len(c) != 14:
+                    avisos_parse.append(
+                        f"Linha {i}: '{linha.strip()}' → {len(c)} dígito(s) — ignorado."
+                    )
+                    continue
+                if c in vistos:
+                    avisos_parse.append(f"Linha {i}: {c} — duplicado, ignorado.")
+                    continue
+                vistos.add(c)
+                cnpjs_parsed.append(c)
+
+            st.info(
+                f"**{len(cnpjs_parsed)}** CNPJ(s) válido(s) reconhecido(s)"
+                + (f" · {len(avisos_parse)} ignorado(s)" if avisos_parse else "")
+            )
+            if avisos_parse:
+                with st.expander("⚠️ Linhas ignoradas"):
+                    for a in avisos_parse:
+                        st.caption(a)
+
+        col3, col4 = st.columns([1, 1])
+        with col3:
+            cnpj_emp_limpo = limpar_cnpj(cnpj_empresa_avulso)
+            gerar_avulso = st.button(
+                "▶ Gerar arquivo Domínio",
+                disabled=(
+                    len(cnpjs_parsed) == 0
+                    or len(cnpj_emp_limpo) != 14
+                ),
+                use_container_width=True,
+                type="primary",
+                key="btn_gerar_avulso",
+            )
+        with col4:
+            limpar_avulso = st.button(
+                "🗑 Limpar",
+                use_container_width=True,
+                key="btn_limpar_avulso",
+            )
+
+        # Mensagem de validação do CNPJ empresa
+        if cnpj_empresa_avulso.strip() and len(cnpj_emp_limpo) != 14:
+            st.warning("⚠️ CNPJ da empresa inválido — deve ter 14 dígitos.")
+
+        if limpar_avulso:
+            for k, v in defaults.items():
+                st.session_state[k] = v
+            st.session_state.log = ["Campos limpos."]
+            st.rerun()
+
+        if gerar_avulso and cnpjs_parsed and len(cnpj_emp_limpo) == 14:
+            for k in defaults:
+                st.session_state[k] = (
+                    ["Iniciando geração (modo CNPJs avulsos)..."]
+                    if k == "log" else None
+                )
+
+            modo_avulso_map = {
+                "🛒 Somente Clientes (0010)":      "clientes",
+                "🏭 Somente Fornecedores (0020)":  "fornecedores",
+                "🔄 Ambos (0010 e 0020)":          "ambos",
+            }
+            modo_av_sel = modo_avulso_map.get(modo_avulso, "ambos")
+
+            linhas, dados_tabela, contadores, cabecalho = processar_cnpjs_avulsos(
+                cnpjs_parsed,
+                cnpj_emp_limpo,
+                modo_av_sel,
+                delay_api,
+                st.session_state.log,
+            )
+
             st.session_state.txt_gerado = "".join(linhas).encode(
                 "latin-1", errors="replace"
             )
-            cnpj_arq = cabecalho["cnpj"] if cabecalho else "empresa"
             st.session_state.nome_arquivo = (
-                f"dominio_separador_{cnpj_arq}_"
+                f"dominio_avulso_{cnpj_emp_limpo}_"
                 f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             )
             st.session_state.dados_tabela = dados_tabela
             st.session_state.contadores   = contadores
             st.session_state.cabecalho    = cabecalho
 
-        st.rerun()
+            st.rerun()
+
+    # ════════════════════════════════════════════════════════════════
+    # RESULTADOS (compartilhados entre as abas)
+    # ════════════════════════════════════════════════════════════════
+    st.markdown("---")
 
     # ── Card empresa ──────────────────────────────────────────────────
     if st.session_state.cabecalho:
@@ -872,16 +1171,20 @@ def main():
             if len(s) == 8 and s.isdigit():
                 return f"{s[0:2]}/{s[2:4]}/{s[4:8]}"
             return s or "—"
+        periodo = (
+            f"{fmt_dt(cab['dt_ini'])} a {fmt_dt(cab['dt_fin'])}"
+            if cab.get("dt_ini") else "—"
+        )
         st.markdown(
             f"""
             <div style="background:#FFF8F0; border-left:4px solid #FF8000;
                         border-radius:4px; padding:12px 18px; margin-bottom:16px;
                         font-family:'Segoe UI',Arial,sans-serif; color:#444;">
-                <b>🏢 Empresa identificada no SPED Fiscal (registro 0000)</b><br>
+                <b>🏢 Empresa identificada</b><br>
                 <b>CNPJ:</b> {cab['cnpj']} &nbsp;|&nbsp;
                 <b>Nome:</b> {cab['nome']} &nbsp;|&nbsp;
                 <b>UF:</b> {cab['uf'] or '—'} &nbsp;|&nbsp;
-                <b>Período:</b> {fmt_dt(cab['dt_ini'])} a {fmt_dt(cab['dt_fin'])}
+                <b>Período:</b> {periodo}
             </div>
             """,
             unsafe_allow_html=True,
@@ -903,11 +1206,11 @@ def main():
             cnt = st.session_state.contadores
             m1, m2, m3, m4, m5, m6 = st.columns(6)
             m1.metric("✅ Ativos (API)",        cnt["api_ativa"])
-            m2.metric("❌ Baixados (SPED)",     cnt["baixada"])
-            m3.metric("⛔ Inaptos (SPED)",      cnt["inapta"])
-            m4.metric("⚠️ Suspensos (SPED)",   cnt["suspensa"])
+            m2.metric("❌ Baixados",            cnt["baixada"])
+            m3.metric("⛔ Inaptos",             cnt["inapta"])
+            m4.metric("⚠️ Suspensos",          cnt["suspensa"])
             m5.metric("🌍 Exterior (SPED)",     cnt["exterior"])
-            m6.metric("ℹ️ CPF/Sem API (SPED)", cnt["cpf_sped"] + cnt["sem_api"])
+            m6.metric("ℹ️ Sem API / CPF",      cnt["cpf_sped"] + cnt["sem_api"])
 
         if st.session_state.dados_tabela:
             import pandas as pd
@@ -942,10 +1245,10 @@ def main():
                 lista = [r for r in st.session_state.dados_tabela
                          if filtro in r["Status"]]
                 if lista:
-                    with st.expander(f"{label} ({len(lista)}) — dados do SPED"):
+                    with st.expander(f"{label} ({len(lista)}) — dados da API"):
                         st.dataframe(
                             pd.DataFrame(lista)[
-                                ["COD_PART", "CNPJ/CPF", "Nome (SPED)", "Papel"]
+                                ["COD_PART", "CNPJ/CPF", "Razão Social (API)", "Papel"]
                             ],
                             use_container_width=True,
                         )
